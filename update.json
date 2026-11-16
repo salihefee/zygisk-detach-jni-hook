@@ -1,6 +1,6 @@
 {
-	"version": "v1.24.0",
-	"versionCode": 35,
-	"zipUrl": "https://github.com/j-hc/zygisk-detach/releases/latest/download/zygisk-detach-v1.24.0.zip",
-	"changelog": "https://raw.githubusercontent.com/j-hc/zygisk-detach/master/README.md"
+	"version": "v1.24.1",
+	"versionCode": 36,
+	"zipUrl": "https://github.com/salihefee/zygisk-detach-jni-hook/releases/latest/download/zygisk-detach-jni-hook-v1.24.1.zip",
+	"changelog": "https://raw.githubusercontent.com/salihefee/zygisk-detach-jni-hook/master/README.md"
 }
