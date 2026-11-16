@@ -1,6 +1,7 @@
 #include "module.hpp"
 
 #include <android/log.h>
+#include <android/api-level.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -12,56 +13,60 @@
 #include <unistd.h>
 
 #include "binder.hpp"
+#include "detach_request.hpp"
 #include "zygisk.hpp"
 
 #define ARR_LEN(a) (sizeof(a) / sizeof((a)[0]))
 #define STR_LEN(a) (ARR_LEN(a) - 1)
 #define VENDING_PROC "com.android.vending"
 
-#define PM_DESC u"android.content.pm.IPackageManager"
-
 static char* DETACH_TXT = nullptr;
+static size_t DETACH_TXT_LEN = 0;
 static size_t HEADERS_LEN = 0;
 static uint32_t getApplicationEnabledSetting_code = 0;
+static jmethodID parcelSize, parcelPosition, parcelSetPosition, parcelMarshall, parcelUnmarshall;
+static jboolean (*transactNative_orig)(JNIEnv*, jobject, jint, jobject, jobject, jint);
 
-static inline void detach(PParcel* pparcel, uint32_t code) {
-    auto parcel = FakeParcel(pparcel->data);
-    if (pparcel->data_size < HEADERS_LEN + 4) return;
-    parcel.skip(HEADERS_LEN);  // header
-
-    auto descLen = parcel.readInt32();
-    auto desc = parcel.readString16(descLen);
-
-    if (code != getApplicationEnabledSetting_code ||
-        STR_LEN(PM_DESC) != descLen ||
-        memcmp(desc, PM_DESC, descLen * sizeof(char16_t)) != 0) {
-        return;
-    }
-    parcel.skip(2);
-
-    auto pkgLen = parcel.readInt32();
-    auto pkg = parcel.readString16(pkgLen);
-
-    auto pkgLenB = (uint8_t)(pkgLen * 2 - 1);
-    size_t i = 0;
-    uint8_t dlen;
-    while ((dlen = DETACH_TXT[i])) {
-        const char* dptr = DETACH_TXT + i + sizeof(dlen);
-        i += sizeof(dlen) + dlen;
-        if (dlen != pkgLenB) continue;
-        if (memcmp(dptr, pkg, dlen) == 0) {
-            *pkg = 0;
-            return;
+// Hook the actual Java Binder entry point. A successful PLT commit does not
+// establish that ReZygisk replaced any libbinder relocation (observed on A16).
+// Parcel's Java API also avoids relying on its private C++ object layout.
+static jboolean transactNative_hook(JNIEnv* env, jobject self, jint code, jobject data,
+                                    jobject reply, jint flags) {
+    if (uint32_t(code) == getApplicationEnabledSetting_code && data && !env->ExceptionCheck()) {
+        const jint size = env->CallIntMethod(data, parcelSize);
+        if (env->ExceptionCheck()) { env->ExceptionClear(); return transactNative_orig(env, self, code, data, reply, flags); }
+        const jint position = env->CallIntMethod(data, parcelPosition);
+        if (!env->ExceptionCheck() && size > 0 && size <= 1024) {
+            auto bytes = static_cast<jbyteArray>(env->CallObjectMethod(data, parcelMarshall));
+            if (!env->ExceptionCheck() && bytes) {
+                uint8_t buffer[1024];
+                const jsize count = env->GetArrayLength(bytes);
+                if (count == size) {
+                    env->GetByteArrayRegion(bytes, 0, count, reinterpret_cast<jbyte*>(buffer));
+                    if (!env->ExceptionCheck()) {
+                        auto package = detachedPackageInRequest(buffer, count, HEADERS_LEN,
+                            reinterpret_cast<const uint8_t*>(DETACH_TXT), DETACH_TXT_LEN);
+                        if (package) {
+                            const jbyte zero[2] = {0, 0};
+                            env->SetByteArrayRegion(bytes, package - buffer, 2, zero);
+                            env->CallVoidMethod(data, parcelUnmarshall, bytes, 0, count);
+                            if (!env->ExceptionCheck()) {
+                                env->CallVoidMethod(data, parcelSetPosition, position);
+                                LOGD("Detached enabled-state query (%u UTF-16 units)", unsigned((count - (package - buffer)) / 2));
+                            }
+                        }
+                    }
+                }
+            }
+            // Unrelated interfaces may have Binder objects and cannot marshal.
+            // Their requests remain intact and are passed to the original JNI.
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (bytes) env->DeleteLocalRef(bytes);
+        } else if (env->ExceptionCheck()) {
+            env->ExceptionClear();
         }
     }
-}
-
-int (*transact_orig)(void*, int32_t, uint32_t, void*, void*, uint32_t);
-
-int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
-    auto parcel = (PParcel*)pdata;
-    detach(parcel, code);
-    return transact_orig(self, handle, code, pdata, preply, flags);
+    return transactNative_orig(env, self, code, data, reply, flags);
 }
 
 static size_t read_companion(int fd) {
@@ -79,11 +84,13 @@ static size_t read_companion(int fd) {
     if (!readFullFromFd(fd, DETACH_TXT, size)) return 0;
 
     DETACH_TXT[size] = 0;
+    DETACH_TXT_LEN = size;
     return (size_t)size;
 }
 
 static bool runPreSpecialize(const char* process, zygisk::Api* api) {
     if (strncmp(process, VENDING_PROC, STR_LEN(VENDING_PROC)) != 0) return false;
+    __android_log_print(ANDROID_LOG_INFO, "zygisk-detach", "Preparing JNI hook for %s", process);
 
     int fd = api->connectCompanion();
     size_t detach_len = read_companion(fd);
@@ -93,7 +100,7 @@ static bool runPreSpecialize(const char* process, zygisk::Api* api) {
     return true;
 }
 
-static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env) {
+static bool installBinderHook(zygisk::Api* api, JNIEnv* env) {
     int sdk = android_get_device_api_level();
     if (sdk <= 0) {
         LOGD("ERROR android_get_device_api_level: %d", sdk);
@@ -105,21 +112,29 @@ static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env
                                                              TRSCTN("getApplicationEnabledSetting"));
     if (getApplicationEnabledSetting_code == 0) return false;
 
-    ino_t inode;
-    dev_t dev;
-    if (!getMapping("libbinder.so", &inode, &dev)) {
-        LOGD("ERROR: Could not get libbinder");
+    jclass parcel = env->FindClass("android/os/Parcel");
+    if (!parcel) { env->ExceptionClear(); return false; }
+    parcelSize = env->GetMethodID(parcel, "dataSize", "()I");
+    parcelPosition = env->GetMethodID(parcel, "dataPosition", "()I");
+    parcelSetPosition = env->GetMethodID(parcel, "setDataPosition", "(I)V");
+    parcelMarshall = env->GetMethodID(parcel, "marshall", "()[B");
+    parcelUnmarshall = env->GetMethodID(parcel, "unmarshall", "([BII)V");
+    env->DeleteLocalRef(parcel);
+    if (env->ExceptionCheck() || !parcelSize || !parcelPosition || !parcelSetPosition ||
+        !parcelMarshall || !parcelUnmarshall) {
+        env->ExceptionClear();
+        LOGD("ERROR: Parcel JNI methods unavailable");
         return false;
     }
-
-    api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
-                         (void**)&transact_hook, (void**)&transact_orig);
-    if (!api->pltHookCommit()) {
-        LOGD("ERROR: pltHookCommit");
+    JNINativeMethod methods[] = {{const_cast<char*>("transactNative"),
+        const_cast<char*>("(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z"),
+        reinterpret_cast<void*>(transactNative_hook)}};
+    api->hookJniNativeMethods(env, "android/os/BinderProxy", methods, 1);
+    transactNative_orig = reinterpret_cast<decltype(transactNative_orig)>(methods[0].fnPtr);
+    if (!transactNative_orig || transactNative_orig == transactNative_hook) {
+        __android_log_print(ANDROID_LOG_ERROR, "zygisk-detach", "BinderProxy JNI hook unavailable");
         return false;
     }
-
-    LOGD("Loaded %s", process);
     return true;
 }
 
@@ -133,6 +148,7 @@ class ZygiskDetach : public zygisk::ModuleBase {
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         process = env->GetStringUTFChars(args->nice_name, nullptr);
         doRunPost = runPreSpecialize(process, api);
+        if (doRunPost) doRunPost = installBinderHook(api, env);
 
         if (!doRunPost) {
             cleanup(args);
@@ -142,9 +158,7 @@ class ZygiskDetach : public zygisk::ModuleBase {
     void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
         if (!doRunPost) return;
 
-        if (!runPostSpecialize(process, api, env)) {
-            cleanup(args);
-        }
+        __android_log_print(ANDROID_LOG_INFO, "zygisk-detach", "Loaded %s (BinderProxy JNI hook)", process);
     }
 
     void preServerSpecialize(zygisk::ServerSpecializeArgs* args) override {
