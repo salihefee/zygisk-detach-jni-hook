@@ -1,7 +1,7 @@
 id=zygisk-detach
 name=zygisk-detach
-version=v1.24.0
+version=v1.24.0-jni-fix
 versionCode=35
 author=j-hc
-description=Detaches installed apps from Play Store
+description=Detaches installed apps from Play Store using the BinderProxy JNI hook
 updateJson=https://raw.githubusercontent.com/j-hc/zygisk-detach/master/update.json
