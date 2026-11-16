@@ -23,6 +23,7 @@
 static char* DETACH_TXT = nullptr;
 static size_t HEADERS_LEN = 0;
 static uint32_t getApplicationEnabledSetting_code = 0;
+static jfieldID parcelNativePtr = nullptr;
 
 static inline void detach(PParcel* pparcel, uint32_t code) {
     auto parcel = FakeParcel(pparcel->data);
@@ -56,12 +57,14 @@ static inline void detach(PParcel* pparcel, uint32_t code) {
     }
 }
 
-int (*transact_orig)(void*, int32_t, uint32_t, void*, void*, uint32_t);
+jboolean (*transact_orig)(JNIEnv*, jobject, jint, jobject, jobject, jint);
 
-int transact_hook(void* self, int32_t handle, uint32_t code, void* pdata, void* preply, uint32_t flags) {
-    auto parcel = (PParcel*)pdata;
-    detach(parcel, code);
-    return transact_orig(self, handle, code, pdata, preply, flags);
+jboolean transact_hook(JNIEnv* env, jobject self, jint code, jobject data, jobject reply, jint flags) {
+    if (data && uint32_t(code) == getApplicationEnabledSetting_code && !env->ExceptionCheck()) {
+        auto parcel = reinterpret_cast<PParcel*>(uintptr_t(env->GetLongField(data, parcelNativePtr)));
+        if (parcel) detach(parcel, code);
+    }
+    return transact_orig(env, self, code, data, reply, flags);
 }
 
 static size_t read_companion(int fd) {
@@ -93,7 +96,7 @@ static bool runPreSpecialize(const char* process, zygisk::Api* api) {
     return true;
 }
 
-static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env) {
+static bool installBinderHook(const char* process, zygisk::Api* api, JNIEnv* env) {
     int sdk = android_get_device_api_level();
     if (sdk <= 0) {
         LOGD("ERROR android_get_device_api_level: %d", sdk);
@@ -105,17 +108,26 @@ static bool runPostSpecialize(const char* process, zygisk::Api* api, JNIEnv* env
                                                              TRSCTN("getApplicationEnabledSetting"));
     if (getApplicationEnabledSetting_code == 0) return false;
 
-    ino_t inode;
-    dev_t dev;
-    if (!getMapping("libbinder.so", &inode, &dev)) {
-        LOGD("ERROR: Could not get libbinder");
+    jclass parcelClass = env->FindClass("android/os/Parcel");
+    if (parcelClass) {
+        parcelNativePtr = env->GetFieldID(parcelClass, "mNativePtr", "J");
+        env->DeleteLocalRef(parcelClass);
+    }
+    if (!parcelNativePtr) {
+        env->ExceptionClear();
+        LOGD("ERROR: Could not get Parcel.mNativePtr");
         return false;
     }
 
-    api->pltHookRegister(dev, inode, "_ZN7android14IPCThreadState8transactEijRKNS_6ParcelEPS1_j",
-                         (void**)&transact_hook, (void**)&transact_orig);
-    if (!api->pltHookCommit()) {
-        LOGD("ERROR: pltHookCommit");
+    // A successful PLT commit can leave libbinder's relocation unchanged on
+    // ReZygisk. Hook the registered Binder JNI entry point instead.
+    JNINativeMethod methods[] = {{const_cast<char*>("transactNative"),
+        const_cast<char*>("(ILandroid/os/Parcel;Landroid/os/Parcel;I)Z"),
+        reinterpret_cast<void*>(transact_hook)}};
+    api->hookJniNativeMethods(env, "android/os/BinderProxy", methods, 1);
+    transact_orig = reinterpret_cast<decltype(transact_orig)>(methods[0].fnPtr);
+    if (!transact_orig || transact_orig == transact_hook) {
+        LOGD("ERROR: Could not hook BinderProxy.transactNative");
         return false;
     }
 
@@ -132,17 +144,10 @@ class ZygiskDetach : public zygisk::ModuleBase {
 
     void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
         process = env->GetStringUTFChars(args->nice_name, nullptr);
-        doRunPost = runPreSpecialize(process, api);
+        bool enabled = runPreSpecialize(process, api);
+        if (enabled) enabled = installBinderHook(process, api, env);
 
-        if (!doRunPost) {
-            cleanup(args);
-        }
-    }
-
-    void postAppSpecialize(const zygisk::AppSpecializeArgs* args) override {
-        if (!doRunPost) return;
-
-        if (!runPostSpecialize(process, api, env)) {
+        if (!enabled) {
             cleanup(args);
         }
     }
@@ -162,7 +167,6 @@ class ZygiskDetach : public zygisk::ModuleBase {
     zygisk::Api* api;
     JNIEnv* env;
 
-    bool doRunPost;
     const char* process;
 };
 
